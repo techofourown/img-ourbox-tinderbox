@@ -1,0 +1,18 @@
+# Build outputs
+/build/
+/dist/
+
+# NVIDIA artifacts (large, keep out of git)
+artifacts/nvidia/*.tbz2
+artifacts/nvidia/*.zip
+artifacts/nvidia/*.tar*
+artifacts/nvidia/*.sha*
+artifacts/nvidia/*.txt
+
+# OS-specific junk
+.DS_Store
+Thumbs.db
+
+# Editor / tooling
+.vscode/
+.idea/

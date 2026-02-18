@@ -1,0 +1,12 @@
+[Unit]
+Description=Ourbox Tinderbox Hello World
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ourbox-hello.sh
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

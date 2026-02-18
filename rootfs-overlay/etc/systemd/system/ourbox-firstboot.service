@@ -1,0 +1,14 @@
+[Unit]
+Description=Ourbox first-boot setup (DATA NVMe)
+After=local-fs.target
+ConditionPathExists=!/var/lib/ourbox/firstboot.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ourbox-firstboot.sh
+StandardOutput=journal+console
+StandardError=journal+console
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

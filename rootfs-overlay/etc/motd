@@ -1,0 +1,7 @@
+Ourbox Tinderbox (Jetson Orin NX) - provisioned image
+
+Check status:
+  sudo journalctl -u ourbox-hello -u ourbox-firstboot --no-pager
+
+Data disk:
+  /data
