@@ -127,6 +127,41 @@ preflight_no_vpn_or_die() {
 UFW_WAS_ACTIVE=0
 FIREWALLD_WAS_ACTIVE=0
 ZT_WAS_STOPPED=0
+FLASH_WORK_DIR=""
+
+# ---------- local staging to eliminate USB bus contention ----------
+
+# The Linux_for_Tegra directory lives on the USB installer stick.
+# The NFS server must serve system.img from that same USB stick OVER the
+# USB Ethernet gadget (RNDIS).  Both paths share the USB host controller,
+# causing bus contention that stalls NFS reads indefinitely (hard-mount
+# hangs for many hours until killed).
+#
+# Fix: rsync Linux_for_Tegra to local disk before flashing so the NFS
+# server reads from the local NVMe, not the USB stick.
+stage_l4t_to_local_disk() {
+  local source_l4t="$1"
+
+  # Prefer /var/tmp (main NVMe, survives reboot) over /tmp (tmpfs, small)
+  FLASH_WORK_DIR="$(mktemp -d /var/tmp/tinderbox-flash.XXXXXX)"
+  local dest="${FLASH_WORK_DIR}/Linux_for_Tegra"
+
+  # Sanity check: enough free space? (L4T + rootfs can be 10-20 GB)
+  local avail_kb
+  avail_kb="$(df --output=avail /var/tmp | tail -1)"
+  local src_kb
+  src_kb="$(du -sk "${source_l4t}" 2>/dev/null | cut -f1)"
+  if (( src_kb > avail_kb )); then
+    die "Not enough space in /var/tmp: need ~$((src_kb/1024))MB, have $((avail_kb/1024))MB.\nFree disk space and retry."
+  fi
+
+  bold "Staging Linux_for_Tegra to local disk (eliminates USB bus contention)"
+  note "Source : ${source_l4t}"
+  note "Dest   : ${dest}"
+  note "Size   : ~$((src_kb/1024))MB — this may take a few minutes..."
+  rsync -a --info=progress2 "${source_l4t}/" "${dest}/"
+  note "Staging complete."
+}
 
 temporarily_disable_firewall() {
   # ufw
@@ -148,7 +183,7 @@ temporarily_disable_firewall() {
   fi
 }
 
-restore_firewall() {
+restore_env() {
   if [[ "${UFW_WAS_ACTIVE}" -eq 1 ]]; then
     note "Re-enabling ufw"
     ufw --force enable 2>/dev/null || true
@@ -161,9 +196,13 @@ restore_firewall() {
     note "Restarting ZeroTier"
     systemctl start zerotier-one 2>/dev/null || true
   fi
+  if [[ -n "${FLASH_WORK_DIR}" && -d "${FLASH_WORK_DIR}" ]]; then
+    note "Removing local flash staging dir: ${FLASH_WORK_DIR}"
+    rm -rf "${FLASH_WORK_DIR}"
+  fi
 }
 
-trap restore_firewall EXIT
+trap restore_env EXIT
 
 # ---------- CHANGE 6: log capture and diagnostics ----------
 
@@ -278,8 +317,13 @@ preflight_nfs_rpc_or_die
 preflight_no_vpn_or_die
 temporarily_disable_firewall
 
-L4T_DIR="${HERE}/Linux_for_Tegra"
-[[ -d "${L4T_DIR}" ]] || die "Missing Linux_for_Tegra directory next to this script. Did you run tools/prepare-installer-media.sh?"
+L4T_SOURCE="${HERE}/Linux_for_Tegra"
+[[ -d "${L4T_SOURCE}" ]] || die "Missing Linux_for_Tegra directory next to this script. Did you run tools/prepare-installer-media.sh?"
+
+# Stage to local disk — must happen before Jetson detection prompts so the
+# user can plug in the Jetson AFTER the (potentially slow) copy is done.
+stage_l4t_to_local_disk "${L4T_SOURCE}"
+L4T_DIR="${FLASH_WORK_DIR}/Linux_for_Tegra"
 
 FLASH_TOOL="${L4T_DIR}/tools/kernel_flash/l4t_initrd_flash.sh"
 [[ -x "${FLASH_TOOL}" ]] || die "Missing initrd flash tool: ${FLASH_TOOL}"
