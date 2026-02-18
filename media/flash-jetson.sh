@@ -328,29 +328,42 @@ L4T_DIR="${FLASH_WORK_DIR}/Linux_for_Tegra"
 FLASH_TOOL="${L4T_DIR}/tools/kernel_flash/l4t_initrd_flash.sh"
 [[ -x "${FLASH_TOOL}" ]] || die "Missing initrd flash tool: ${FLASH_TOOL}"
 
-note "Checking for Jetson in Force Recovery Mode (USB id 0955:XXXX)"
-mapfile -t ids < <(lsusb | awk '/0955:/{print $6}' | sort -u)
+detect_jetson_recovery() {
+  local ids=() matches=() id
+  mapfile -t ids < <(lsusb | awk '/0955:/{print $6}' | sort -u)
+  for id in "${ids[@]}"; do
+    case "$id" in
+      0955:7323|0955:7423) matches+=("$id") ;;
+    esac
+  done
+  JETSON_MATCHES=("${matches[@]+"${matches[@]}"}")
+}
 
-# Keep only the ones we care about
-matches=()
-for id in "${ids[@]}"; do
-  case "$id" in
-    0955:7323|0955:7423) matches+=("$id") ;;
-    0955:*) ;;
-  esac
+note "Waiting for Jetson in Force Recovery Mode (USB id 0955:7323 or 0955:7423)"
+echo "  To enter Force Recovery: hold RECOVERY button, press RESET (or power on), release RECOVERY."
+echo
+
+JETSON_MATCHES=()
+while true; do
+  detect_jetson_recovery
+
+  if [[ "${#JETSON_MATCHES[@]}" -gt 1 ]]; then
+    die "More than one supported Jetson detected (${JETSON_MATCHES[*]}). This tool is single-device."
+  fi
+
+  if [[ "${#JETSON_MATCHES[@]}" -eq 1 ]]; then
+    case "${JETSON_MATCHES[0]}" in
+      0955:7323) note "Detected: Jetson Orin NX 16GB (0955:7323)" ;;
+      0955:7423) note "Detected: Jetson Orin NX 8GB (0955:7423)" ;;
+    esac
+    break
+  fi
+
+  echo "  No supported Jetson found yet."
+  echo "  Current NVIDIA USB devices: $(lsusb | grep '0955:' | awk '{print $6}' | tr '\n' ' ' || echo '(none)')"
+  read -r -p "  Press ENTER to rescan, or type q to quit: " _choice
+  [[ "${_choice}" == "q" || "${_choice}" == "Q" ]] && die "operator quit"
 done
-
-if [[ "${#matches[@]}" -eq 0 ]]; then
-  die "No supported Jetson Orin NX detected in Force Recovery.\nExpected lsusb to show 0955:7323 (NX16) or 0955:7423 (NX8)."
-fi
-if [[ "${#matches[@]}" -gt 1 ]]; then
-  die "More than one supported Jetson detected (${matches[*]}). This tool is single-device on purpose."
-fi
-
-case "${matches[0]}" in
-  0955:7323) note "Detected: Jetson Orin NX 16GB (0955:7323)" ;;
-  0955:7423) note "Detected: Jetson Orin NX 8GB (0955:7423)" ;;
-esac
 
 # Load defaults
 # shellcheck disable=SC1090
