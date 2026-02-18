@@ -41,12 +41,58 @@ load_defaults_env() {
   fi
 }
 
-# Print a numbered list to stdout; returns nothing.
-print_block_devices() {
-  # NAME SIZE MODEL TRAN RM TYPE
-  # We prefer removable USB 'disk' devices.
-  lsblk -dpno NAME,SIZE,MODEL,TRAN,RM,TYPE \
-    | awk '$6=="disk" {print}'
+# Returns the whole-disk device that backs /  (e.g. /dev/sda, /dev/nvme0n1).
+root_backing_disk() {
+  local root_src root_real root_parent
+  root_src="$(findmnt -nr -o SOURCE / 2>/dev/null || true)"
+  root_real="$(readlink -f "${root_src}" 2>/dev/null || echo "${root_src}")"
+  root_parent="$(lsblk -no PKNAME "${root_real}" 2>/dev/null || true)"
+  if [[ -n "${root_parent}" ]]; then
+    echo "/dev/${root_parent}"
+  else
+    echo "${root_real}"
+  fi
+}
+
+# Echoes the best /dev/disk/by-id path for a disk, preferring usb-* symlinks.
+preferred_byid_for_disk() {
+  local disk="$1"
+  local best=""
+  local p target base
+
+  for p in /dev/disk/by-id/*; do
+    [[ -L "${p}" ]] || continue
+    [[ "${p}" == *-part* ]] && continue
+    target="$(readlink -f "${p}" 2>/dev/null || true)"
+    [[ "${target}" == "${disk}" ]] || continue
+
+    base="$(basename "${p}")"
+    if [[ "${base}" == usb-* ]]; then
+      echo "${p}"
+      return 0
+    fi
+    [[ -z "${best}" ]] && best="${p}"
+  done
+
+  [[ -n "${best}" ]] && echo "${best}" || true
+}
+
+# Returns 0 only if disk is a USB or removable disk that is NOT the root disk.
+# NVMe, SATA internal, and the disk backing / are all rejected.
+is_candidate_media_disk() {
+  local disk="$1"
+  local root_disk="$2"
+  local type tran rm
+
+  type="$(lsblk -dn -o TYPE "${disk}" 2>/dev/null | tr -d '[:space:]')"
+  [[ "${type}" == "disk" ]] || return 1
+  [[ "${disk}" != "${root_disk}" ]] || return 1
+
+  tran="$(lsblk -dn -o TRAN "${disk}" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+  rm="$(lsblk -dn -o RM "${disk}" 2>/dev/null | tr -d '[:space:]')"
+  [[ "${tran}" == "usb" || "${rm}" == "1" ]] || return 1
+
+  return 0
 }
 
 confirm_dangerous() {
@@ -58,7 +104,6 @@ confirm_dangerous() {
 
 unmount_partitions() {
   local disk="$1"
-  # Unmount anything mounted from this disk.
   mapfile -t mps < <(lsblk -lnpo NAME,MOUNTPOINT "$disk" | awk 'NF==2 {print $1 "|" $2}')
   local line dev mp
   for line in "${mps[@]}"; do

@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/_common.sh"
 
+# ---------- NVIDIA artifact fetch ----------
+
 maybe_fetch_nvidia_artifacts() {
   local root="$1"
   local bsp="$2"
@@ -31,9 +33,115 @@ maybe_fetch_nvidia_artifacts() {
   "${fetch}"
 }
 
+# ---------- USB target selection ----------
+
+declare -a CANDIDATE_DISKS=()
+
+refresh_candidate_disks() {
+  local root_disk="$1"
+  CANDIDATE_DISKS=()
+  while read -r disk; do
+    [[ -n "${disk}" ]] || continue
+    if is_candidate_media_disk "${disk}" "${root_disk}"; then
+      CANDIDATE_DISKS+=("${disk}")
+    fi
+  done < <(lsblk -dn -o NAME,TYPE | awk '$2=="disk" {print "/dev/"$1}')
+}
+
+print_candidate_disks() {
+  local idx disk size tran model serial byid
+
+  echo
+  echo "Detected removable/USB target candidates:"
+  echo
+  printf '  %-3s %-14s %-8s %-6s %-22s %-14s\n' "#" "Device" "Size" "Tran" "Model" "Serial"
+  for idx in "${!CANDIDATE_DISKS[@]}"; do
+    disk="${CANDIDATE_DISKS[$idx]}"
+    size="$(lsblk -dn -o SIZE "${disk}" 2>/dev/null | tr -d '[:space:]')"
+    tran="$(lsblk -dn -o TRAN "${disk}" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    model="$(lsblk -dn -o MODEL "${disk}" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    serial="$(lsblk -dn -o SERIAL "${disk}" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [[ -n "${tran}" ]] || tran="-"
+    [[ -n "${model}" ]] || model="-"
+    [[ -n "${serial}" ]] || serial="-"
+    printf '  %-3s %-14s %-8s %-6s %-22.22s %-14.14s\n' \
+      "$((idx + 1))" "${disk}" "${size}" "${tran}" "${model}" "${serial}"
+
+    byid="$(preferred_byid_for_disk "${disk}" || true)"
+    if [[ -n "${byid}" ]]; then
+      echo "      by-id: ${byid}"
+    fi
+
+    echo "      partitions (name fstype label mountpoints):"
+    lsblk -nr -o NAME,FSTYPE,LABEL,MOUNTPOINTS "${disk}" 2>/dev/null | sed 's/^/        /'
+  done
+  echo
+}
+
+validate_target_dev_or_die() {
+  local target="$1"
+  local root_disk="$2"
+  local target_real target_type
+
+  [[ -n "${target}" ]] || die "target device is empty"
+  [[ -e "${target}" ]] || die "target device does not exist: ${target}"
+
+  target_real="$(readlink -f "${target}")"
+  target_type="$(lsblk -dn -o TYPE "${target_real}" 2>/dev/null | tr -d '[:space:]')"
+  [[ "${target_type}" == "disk" ]] || die "target is not a raw disk: ${target_real}"
+  [[ "${target_real}" != "${root_disk}" ]] || die "refusing target that backs / (${root_disk})"
+}
+
+select_target_device_interactive() {
+  local root_disk="$1"
+  local choice idx selected byid confirm
+
+  while true; do
+    refresh_candidate_disks "${root_disk}"
+
+    if (( ${#CANDIDATE_DISKS[@]} == 0 )); then
+      echo
+      echo "No removable/USB disk candidates found."
+      echo "Insert the target USB media, then rescan."
+      read -r -p "Press ENTER to rescan, or type q to quit: " choice
+      [[ "${choice}" == "q" || "${choice}" == "Q" ]] && die "no target media selected"
+      continue
+    fi
+
+    print_candidate_disks
+    read -r -p "Select target number (r=rescan, q=quit): " choice
+    case "${choice}" in
+      r|R) continue ;;
+      q|Q) die "operator canceled target media selection" ;;
+    esac
+
+    [[ "${choice}" =~ ^[0-9]+$ ]] || { warn "invalid selection: ${choice}"; continue; }
+    idx="$((choice - 1))"
+    (( idx >= 0 && idx < ${#CANDIDATE_DISKS[@]} )) || { warn "selection out of range: ${choice}"; continue; }
+
+    selected="${CANDIDATE_DISKS[$idx]}"
+    byid="$(preferred_byid_for_disk "${selected}" || true)"
+    if [[ -n "${byid}" ]]; then
+      selected="${byid}"
+    fi
+
+    validate_target_dev_or_die "${selected}" "${root_disk}"
+    echo
+    lsblk -o NAME,SIZE,MODEL,SERIAL,TYPE,FSTYPE,LABEL,MOUNTPOINTS "${selected}" || true
+    echo
+    read -r -p "Type SELECT to use ${selected}: " confirm
+    [[ "${confirm}" == "SELECT" ]] || { warn "selection not confirmed; returning to list"; continue; }
+    TARGET_DEV="${selected}"
+    return 0
+  done
+}
+
+# ---------- main ----------
+
 main() {
   require_root
-  require_cmd lsblk awk sed grep cut tr head tail tar rsync parted mkfs.ext4 mount umount sync lsusb wipefs
+  require_cmd lsblk awk sed grep cut tr head tail tar rsync parted mkfs.ext4 \
+              mount umount sync wipefs readlink findmnt
   load_defaults_env
 
   local root
@@ -54,45 +162,21 @@ main() {
   note "ROOTFS:${NVIDIA_ROOTFS_TARBALL}"
   echo
 
-  bold "Select target USB disk (WILL BE ERASED)"
-  local disks=()
-  local line
-  while IFS= read -r line; do
-    disks+=("$line")
-  done < <(print_block_devices)
+  local root_disk
+  root_disk="$(root_backing_disk)"
 
-  if [[ "${#disks[@]}" -eq 0 ]]; then
-    die "No block devices found via lsblk."
-  fi
+  local TARGET_DEV=""
+  select_target_device_interactive "${root_disk}"
+  validate_target_dev_or_die "${TARGET_DEV}" "${root_disk}"
 
-  local i=1
-  for line in "${disks[@]}"; do
-    printf "  [%d] %s\n" "${i}" "${line}"
-    i=$((i+1))
-  done
-
-  echo
-  local choice
-  read -r -p "Enter the number of the USB disk to erase: " choice
-  [[ "$choice" =~ ^[0-9]+$ ]] || die "Invalid selection."
-  (( choice >= 1 && choice <= ${#disks[@]} )) || die "Selection out of range."
-
-  local selected="${disks[$((choice-1))]}"
   local disk
-  disk="$(awk '{print $1}' <<<"$selected")"
-
-  # Strong suggestion: only allow TRAN=usb or RM=1
-  local tran rm
-  tran="$(awk '{print $4}' <<<"$selected")"
-  rm="$(awk '{print $5}' <<<"$selected")"
-  if [[ "${tran}" != "usb" && "${rm}" != "1" ]]; then
-    warn "Selected disk does not look like removable USB (TRAN=${tran}, RM=${rm})."
-    warn "If you are absolutely sure, you can continue — but double-check!"
-  fi
+  disk="$(readlink -f "${TARGET_DEV}")"
 
   echo
   bold "DANGER ZONE"
-  printf "About to ERASE: %s\n\n" "${selected}"
+  printf "About to ERASE: %s\n\n" "${disk}"
+  lsblk -o NAME,SIZE,MODEL,SERIAL,TRAN,RM "${disk}" || true
+  echo
   confirm_dangerous "Type YES to erase ${disk}: "
 
   unmount_partitions "${disk}"
@@ -157,8 +241,10 @@ main() {
 
   note "Enabling ourbox systemd services (offline enable via symlinks)"
   mkdir -p "${l4t}/rootfs/etc/systemd/system/multi-user.target.wants"
-  ln -sf ../ourbox-hello.service "${l4t}/rootfs/etc/systemd/system/multi-user.target.wants/ourbox-hello.service"
-  ln -sf ../ourbox-firstboot.service "${l4t}/rootfs/etc/systemd/system/multi-user.target.wants/ourbox-firstboot.service"
+  ln -sf ../ourbox-hello.service \
+    "${l4t}/rootfs/etc/systemd/system/multi-user.target.wants/ourbox-hello.service"
+  ln -sf ../ourbox-firstboot.service \
+    "${l4t}/rootfs/etc/systemd/system/multi-user.target.wants/ourbox-firstboot.service"
 
   note "Copying installer payload onto USB"
   mkdir -p "${mnt}/tinderbox"
