@@ -9,6 +9,9 @@ artifacts/nvidia/*.tar*
 artifacts/nvidia/*.sha*
 artifacts/nvidia/*.txt
 
+# Flash logs (runtime output)
+flash-logs/
+
 # OS-specific junk
 .DS_Store
 Thumbs.db

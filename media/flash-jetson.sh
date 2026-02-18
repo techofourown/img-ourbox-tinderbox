@@ -28,8 +28,8 @@ require_cmd_local() {
   done
 }
 
-# Install all packages the NVIDIA flash tool needs upfront so the user
-# isn't interrupted mid-flash with a missing-binary error.
+# ---------- CHANGE 1: full NFS/RPC dependency set ----------
+
 ensure_flash_deps() {
   local pkgs=(
     sshpass           # used by l4t_initrd_flash.sh for SSH over USB
@@ -37,7 +37,9 @@ ensure_flash_deps() {
     libxml2-utils     # provides xmllint, used to parse flash XMLs
     zstd              # used to decompress initrd payloads
     android-sdk-libsparse-utils  # provides simg2img for sparse images
-    nfs-kernel-server # used by the flash tool's NFS network mode
+    nfs-kernel-server # NFS server for rootfs streaming to Jetson
+    nfs-common        # NFS client utilities and RPC plumbing
+    rpcbind           # RPC portmapper, required for NFS to function
   )
 
   local missing=()
@@ -58,6 +60,8 @@ ensure_flash_deps() {
   note "Flash dependencies installed."
 }
 
+# ---------- udev rule for USB Ethernet gadget ----------
+
 # The NVIDIA initrd flash tool creates a USB Ethernet gadget (RNDIS)
 # named "usb0" for the host<->Jetson link.  Ubuntu's Predictable Network
 # Interface Names renames it to "enx<mac>", which silently breaks the
@@ -75,6 +79,120 @@ ensure_usb0_udev_rule() {
   udevadm control --reload-rules
   udevadm trigger --subsystem-match=net
   note "udev rule installed: ${rule_file}"
+}
+
+# ---------- CHANGE 2: force NFS/RPC into known-good state ----------
+
+preflight_nfs_rpc_or_die() {
+  note "Ensuring NFS/RPC services are running"
+  systemctl enable --now rpcbind 2>/dev/null || true
+  systemctl enable --now nfs-kernel-server 2>/dev/null || true
+  systemctl restart rpcbind nfs-kernel-server || die "Failed to restart NFS/RPC services."
+
+  exportfs -ra 2>/dev/null || true
+  note "Current NFS exports:"
+  exportfs -v 2>/dev/null || echo "  (none — the flash tool will add them dynamically)"
+  note "NFS/RPC preflight OK"
+}
+
+# ---------- CHANGE 3: hard-block VPN interference ----------
+
+preflight_no_vpn_or_die() {
+  local vpn_ifaces=("tun0" "tun1" "wg0" "wg1" "tailscale0" "ppp0")
+  local iface
+
+  for iface in "${vpn_ifaces[@]}"; do
+    if ip link show "${iface}" 2>/dev/null | grep -q 'state UP'; then
+      die "VPN interface ${iface} is UP. Disconnect VPN and retry.\n\nInitrd flash uses NFS over usb0 (IPv6 fc00::). VPN commonly breaks routing/firewalling for this link."
+    fi
+  done
+
+  # ZeroTier uses randomized interface names — check by driver
+  local zt_iface
+  zt_iface="$(ip link show 2>/dev/null | grep -oP '(?<=: )zt[a-z0-9]+(?=:)' || true)"
+  if [[ -n "${zt_iface}" ]]; then
+    if ip link show "${zt_iface}" 2>/dev/null | grep -q 'state UP\|state UNKNOWN'; then
+      warn "ZeroTier interface ${zt_iface} is active."
+      warn "ZeroTier can interfere with IPv6 routing for the USB flash link."
+      warn "Stopping ZeroTier for the duration of the flash..."
+      systemctl stop zerotier-one 2>/dev/null || true
+      ZT_WAS_STOPPED=1
+      note "ZeroTier stopped. Will restart on exit."
+    fi
+  fi
+}
+
+# ---------- CHANGE 4: neutralize host firewall during flash ----------
+
+UFW_WAS_ACTIVE=0
+FIREWALLD_WAS_ACTIVE=0
+ZT_WAS_STOPPED=0
+
+temporarily_disable_firewall() {
+  # ufw
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw status 2>/dev/null | grep -q 'Status: active'; then
+      warn "Disabling ufw for the duration of the flash (NFS/RPC needs open ports)"
+      ufw disable || true
+      UFW_WAS_ACTIVE=1
+    fi
+  fi
+
+  # firewalld
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+      warn "Stopping firewalld for the duration of the flash"
+      systemctl stop firewalld || true
+      FIREWALLD_WAS_ACTIVE=1
+    fi
+  fi
+}
+
+restore_firewall() {
+  if [[ "${UFW_WAS_ACTIVE}" -eq 1 ]]; then
+    note "Re-enabling ufw"
+    ufw --force enable 2>/dev/null || true
+  fi
+  if [[ "${FIREWALLD_WAS_ACTIVE}" -eq 1 ]]; then
+    note "Restarting firewalld"
+    systemctl start firewalld 2>/dev/null || true
+  fi
+  if [[ "${ZT_WAS_STOPPED}" -eq 1 ]]; then
+    note "Restarting ZeroTier"
+    systemctl start zerotier-one 2>/dev/null || true
+  fi
+}
+
+trap restore_firewall EXIT
+
+# ---------- CHANGE 6: log capture and diagnostics ----------
+
+LOG_DIR="${HERE}/flash-logs"
+
+dump_failure_diagnostics() {
+  local log_file="$1"
+
+  bold "FLASH FAILED"
+  echo
+  echo "Log file: ${log_file}"
+  echo
+  bold "Last 50 lines of flash log:"
+  tail -50 "${log_file}" 2>/dev/null || true
+  echo
+  bold "Host diagnostic snapshot:"
+  echo "--- NFS/RPC status ---"
+  systemctl --no-pager -l status rpcbind nfs-kernel-server 2>/dev/null || true
+  echo "--- NFS exports ---"
+  exportfs -v 2>/dev/null || true
+  echo "--- ufw ---"
+  ufw status 2>/dev/null || echo "(ufw not installed)"
+  echo "--- network interfaces ---"
+  ip addr show 2>/dev/null || true
+  echo "--- IPv6 routes ---"
+  ip -6 route show 2>/dev/null || true
+  echo "--- USB devices ---"
+  lsusb 2>/dev/null | grep -i nvidia || echo "(no NVIDIA USB devices)"
+  echo
 }
 
 # ---------- NVMe selection ----------
@@ -156,6 +274,9 @@ require_root_local
 require_cmd_local lsusb awk sed grep cut
 ensure_flash_deps
 ensure_usb0_udev_rule
+preflight_nfs_rpc_or_die
+preflight_no_vpn_or_die
+temporarily_disable_firewall
 
 L4T_DIR="${HERE}/Linux_for_Tegra"
 [[ -d "${L4T_DIR}" ]] || die "Missing Linux_for_Tegra directory next to this script. Did you run tools/prepare-installer-media.sh?"
@@ -217,18 +338,39 @@ note "Flashing QSPI + OS NVMe using initrd flash (no GUI)."
 note "This can take a while. Do not unplug until it completes."
 echo
 
+mkdir -p "${LOG_DIR}"
+FLASH_LOG="${LOG_DIR}/flash-$(date -u +'%Y%m%dT%H%M%SZ').log"
+note "Flash log: ${FLASH_LOG}"
+
 pushd "${L4T_DIR}" >/dev/null
 
-# Based on NVIDIA Quick Start for Jetson Linux R36.5 (Orin Nano Dev Kit config).
-# We intentionally DO NOT use the '-super' configuration.
-./tools/kernel_flash/l4t_initrd_flash.sh \
-  --external-device "${OS_PART}" \
-  -c tools/kernel_flash/flash_l4t_t234_nvme.xml \
-  -p "-c bootloader/generic/cfg/flash_t234_qspi.xml" \
-  --showlogs --network usb0 \
+# CHANGE 5: inhibit sleep/shutdown on laptops during flash
+FLASH_CMD=(
+  ./tools/kernel_flash/l4t_initrd_flash.sh
+  --external-device "${OS_PART}"
+  -c tools/kernel_flash/flash_l4t_t234_nvme.xml
+  -p "-c bootloader/generic/cfg/flash_t234_qspi.xml"
+  --showlogs --network usb0
   jetson-orin-nano-devkit internal
+)
+
+flash_rc=0
+if command -v systemd-inhibit >/dev/null 2>&1; then
+  systemd-inhibit \
+    --what=sleep:shutdown:idle \
+    --mode=block \
+    --why="Jetson flashing (NFS over USB)" \
+    "${FLASH_CMD[@]}" 2>&1 | tee "${FLASH_LOG}" || flash_rc=$?
+else
+  "${FLASH_CMD[@]}" 2>&1 | tee "${FLASH_LOG}" || flash_rc=$?
+fi
 
 popd >/dev/null
+
+if [[ "${flash_rc}" -ne 0 ]]; then
+  dump_failure_diagnostics "${FLASH_LOG}"
+  die "Flash failed with exit code ${flash_rc}. See diagnostics above and log: ${FLASH_LOG}"
+fi
 
 echo
 note "Flash complete."
