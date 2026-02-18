@@ -5,6 +5,32 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/_common.sh"
 
+maybe_fetch_nvidia_artifacts() {
+  local root="$1"
+  local bsp="$2"
+  local rootfs="$3"
+
+  if [[ -f "${bsp}" && -f "${rootfs}" ]]; then
+    return 0
+  fi
+
+  warn "Missing required NVIDIA artifacts in artifacts/nvidia/."
+  [[ -f "${bsp}" ]] || warn "  - ${bsp}"
+  [[ -f "${rootfs}" ]] || warn "  - ${rootfs}"
+  echo
+  warn "These files are NOT committed to git."
+  warn "We can download them now (online step), then everything else runs offline/airgapped."
+  echo
+
+  local fetch="${root}/tools/fetch-nvidia-artifacts.sh"
+  [[ -x "${fetch}" ]] || die "Missing fetch script: ${fetch}"
+
+  read -r -p "Type YES to download the NVIDIA artifacts now: " ans
+  [[ "${ans}" == "YES" ]] || die "Aborted. Run: ./tools/fetch-nvidia-artifacts.sh"
+
+  "${fetch}"
+}
+
 main() {
   require_root
   require_cmd lsblk awk sed grep cut tr head tail tar rsync parted mkfs.ext4 mount umount sync lsusb wipefs
@@ -17,8 +43,10 @@ main() {
   local bsp="${art_dir}/${NVIDIA_BSP_TARBALL}"
   local rootfs="${art_dir}/${NVIDIA_ROOTFS_TARBALL}"
 
-  [[ -f "${bsp}" ]] || die "Missing BSP tarball: ${bsp}\nSee README.md (artifacts/nvidia/)."
-  [[ -f "${rootfs}" ]] || die "Missing sample rootfs tarball: ${rootfs}\nSee README.md (artifacts/nvidia/)."
+  maybe_fetch_nvidia_artifacts "${root}" "${bsp}" "${rootfs}"
+
+  [[ -f "${bsp}" ]] || die "Missing BSP tarball: ${bsp}\nRun: ./tools/fetch-nvidia-artifacts.sh"
+  [[ -f "${rootfs}" ]] || die "Missing sample rootfs tarball: ${rootfs}\nRun: ./tools/fetch-nvidia-artifacts.sh"
 
   bold "Tinderbox installer media preparation"
   note "L4T_RELEASE=${L4T_RELEASE}"

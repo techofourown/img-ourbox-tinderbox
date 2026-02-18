@@ -31,9 +31,22 @@ git clone --recurse-submodules https://github.com/techofourown/img-ourbox-tinder
 cd img-ourbox-tinderbox
 ```
 
-### 1) Add NVIDIA artifacts (one-time)
+### 1) Fetch NVIDIA artifacts (one-time, online step)
 
-Download these from NVIDIA and copy them into:
+The NVIDIA Jetson Linux artifacts are **not stored in git**.
+
+This is the **only** step that requires internet access.
+
+```bash
+./tools/fetch-nvidia-artifacts.sh
+```
+
+That script will:
+- show the NVIDIA release + license URLs
+- ask you to confirm you accept NVIDIA’s terms
+- download the tarballs into `artifacts/nvidia/`
+
+If you prefer to place files manually, the required filenames are:
 
 ```
 artifacts/nvidia/
@@ -41,15 +54,15 @@ artifacts/nvidia/
   Tegra_Linux_Sample-Root-Filesystem_R36.5.0_aarch64.tbz2
 ```
 
-> We intentionally do **zero network downloads** in the scripts.
-
 ### 2) Prepare installer USB (on a Linux x86_64 host)
 
 This will **erase** the selected USB drive and write a self-contained offline flasher onto it.
 
 ```bash
-./tools/prepare-installer-media.sh
+sudo ./tools/prepare-installer-media.sh
 ```
+
+If the NVIDIA artifacts are missing, `prepare-installer-media.sh` will offer to download them for you.
 
 When it finishes, you’ll have a USB drive labeled `TINDERBOX_INSTALLER`.
 
@@ -85,9 +98,9 @@ Edit `config/defaults.env` before preparing the installer USB if you want to cha
 
 ## Repo layout
 
+- `tools/fetch-nvidia-artifacts.sh` — downloads NVIDIA artifacts (online step; requires license acceptance)
 - `tools/prepare-installer-media.sh` — builds the offline installer USB
 - `media/flash-jetson.sh` — copied onto the USB; flashes the Jetson via Linux_for_Tegra initrd flash
 - `rootfs-overlay/` — files injected into the Jetson rootfs
   - `ourbox-hello.service` prints hello world every boot
   - `ourbox-firstboot.service` sets up the DATA NVMe on first boot
-
