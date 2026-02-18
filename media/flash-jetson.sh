@@ -58,6 +58,25 @@ ensure_flash_deps() {
   note "Flash dependencies installed."
 }
 
+# The NVIDIA initrd flash tool creates a USB Ethernet gadget (RNDIS)
+# named "usb0" for the host<->Jetson link.  Ubuntu's Predictable Network
+# Interface Names renames it to "enx<mac>", which silently breaks the
+# tool's IPv6/NFS setup.  This udev rule keeps the interface as "usb0".
+ensure_usb0_udev_rule() {
+  local rule_file="/etc/udev/rules.d/99-usb0-jetson.rules"
+  local rule='SUBSYSTEM=="net", ACTION=="add", DRIVERS=="rndis_host", NAME="usb0"'
+
+  if [[ -f "${rule_file}" ]] && grep -qF 'rndis_host' "${rule_file}"; then
+    return 0
+  fi
+
+  note "Installing udev rule to keep USB Ethernet gadget named usb0"
+  echo "${rule}" > "${rule_file}"
+  udevadm control --reload-rules
+  udevadm trigger --subsystem-match=net
+  note "udev rule installed: ${rule_file}"
+}
+
 # ---------- NVMe selection ----------
 
 # The Jetson's internal NVMe drives are not visible to the host as block
@@ -136,6 +155,7 @@ select_nvme_interactive() {
 require_root_local
 require_cmd_local lsusb awk sed grep cut
 ensure_flash_deps
+ensure_usb0_udev_rule
 
 L4T_DIR="${HERE}/Linux_for_Tegra"
 [[ -d "${L4T_DIR}" ]] || die "Missing Linux_for_Tegra directory next to this script. Did you run tools/prepare-installer-media.sh?"
