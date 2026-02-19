@@ -40,6 +40,7 @@ ensure_flash_deps() {
     nfs-kernel-server # NFS server for rootfs streaming to Jetson
     nfs-common        # NFS client utilities and RPC plumbing
     rpcbind           # RPC portmapper, required for NFS to function
+    ethtool           # used to disable offloads on usb0 for stability
   )
 
   local missing=()
@@ -78,6 +79,58 @@ ensure_usb0_udev_rule() {
   echo "${rule}" > "${rule_file}"
   udevadm control --reload-rules
   udevadm trigger --subsystem-match=net
+  note "udev rule installed: ${rule_file}"
+}
+
+ensure_usb0_offload_udev_rule() {
+  local rule_file="/etc/udev/rules.d/99-usb0-jetson-offloads.rules"
+
+  # Disable offloads that commonly break NFS over USB gadget NICs.
+  # Use a helper script so udev RUN isn't a giant one-liner.
+  local helper="/usr/local/sbin/tinderbox-usb0-offloads.sh"
+
+  if [[ ! -x "${helper}" ]]; then
+    cat > "${helper}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+IFACE="${1:-usb0}"
+
+# udev can fire before the interface is fully ready; give it a moment.
+for _ in {1..20}; do
+  ip link show "${IFACE}" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+
+# Bring link up and make it boring/stable.
+ip link set "${IFACE}" up || true
+ip link set "${IFACE}" mtu 1500 || true
+
+# Disable problematic offloads (critical).
+if command -v ethtool >/dev/null 2>&1; then
+  ethtool -K "${IFACE}" tso off gso off gro off lro off tx off rx off sg off 2>/dev/null || true
+  ethtool -K "${IFACE}" tx-checksum-ip-generic off rx-checksum off 2>/dev/null || true
+fi
+
+# Increase queue length a bit; helps sustained streams.
+ip link set "${IFACE}" txqueuelen 1000 2>/dev/null || true
+
+exit 0
+EOF
+    chmod 0755 "${helper}"
+  fi
+
+  # udev rule: run helper when usb0 appears, for multiple possible drivers
+  # (Jetson gadget can show as rndis_host, cdc_ether, cdc_ncm depending on host/kernel).
+  local rule='SUBSYSTEM=="net", ACTION=="add", NAME=="usb0", RUN+="/usr/local/sbin/tinderbox-usb0-offloads.sh usb0"'
+
+  if [[ -f "${rule_file}" ]] && grep -qF 'tinderbox-usb0-offloads' "${rule_file}"; then
+    return 0
+  fi
+
+  note "Installing udev rule to disable offloads on usb0 (stabilizes NFS over USB)"
+  echo "${rule}" > "${rule_file}"
+  udevadm control --reload-rules
   note "udev rule installed: ${rule_file}"
 }
 
@@ -280,6 +333,8 @@ dump_failure_diagnostics() {
   ip -6 route show 2>/dev/null || true
   echo "--- USB devices ---"
   lsusb 2>/dev/null | grep -i nvidia || echo "(no NVIDIA USB devices)"
+  echo "--- kernel: recent USB events ---"
+  dmesg -T 2>/dev/null | tail -200 | grep -iE 'usb|xhci|rndis|cdc_ether|cdc_ncm|disconnect|reset' || true
   echo
 }
 
@@ -362,6 +417,7 @@ require_root_local
 require_cmd_local lsusb awk sed grep cut
 ensure_flash_deps
 ensure_usb0_udev_rule
+ensure_usb0_offload_udev_rule
 preflight_nfs_rpc_or_die
 preflight_no_vpn_or_die
 temporarily_disable_firewall
