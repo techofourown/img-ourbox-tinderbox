@@ -83,7 +83,8 @@ ensure_usb0_udev_rule() {
 }
 
 ensure_usb0_offload_udev_rule() {
-  local rule_file="/etc/udev/rules.d/99-usb0-jetson-offloads.rules"
+  # Must sort AFTER rename rule (99-usb0-jetson.rules), so use zz suffix.
+  local rule_file="/etc/udev/rules.d/99-zz-usb0-jetson-offloads.rules"
 
   # Disable offloads that commonly break NFS over USB gadget NICs.
   # Use a helper script so udev RUN isn't a giant one-liner.
@@ -132,6 +133,55 @@ EOF
   echo "${rule}" > "${rule_file}"
   udevadm control --reload-rules
   note "udev rule installed: ${rule_file}"
+}
+
+find_usb_net_iface() {
+  if ip link show usb0 >/dev/null 2>&1; then
+    echo "usb0"
+    return 0
+  fi
+
+  ip -o link show | awk -F': ' '{print $2}' | grep -E '^enx' | head -n1 || true
+}
+
+apply_usb_offloads_now() {
+  # Safety net: if udev ordering/race skipped RUN action, apply explicitly now.
+  local iface
+  iface="$(find_usb_net_iface)"
+  [[ -n "${iface}" ]] || { warn "No usb0/enx interface found yet; cannot apply offload settings now."; return 0; }
+
+  note "Applying USB NIC stability settings immediately on ${iface}"
+  ip link set "${iface}" up 2>/dev/null || true
+  ip link set "${iface}" mtu 1500 2>/dev/null || true
+  if command -v ethtool >/dev/null 2>&1; then
+    ethtool -K "${iface}" tso off gso off gro off lro off tx off rx off sg off 2>/dev/null || true
+    ethtool -K "${iface}" tx-checksum-ip-generic off rx-checksum off 2>/dev/null || true
+  fi
+  ip link set "${iface}" txqueuelen 1000 2>/dev/null || true
+}
+
+wait_for_target_ssh() {
+  local timeout_s="${1:-180}"
+  local i
+
+  for (( i=0; i<timeout_s; i++ )); do
+    if sshpass -p root ssh -6 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=2 root@fc00:1:1:0::2 'echo ok' >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  return 1
+}
+
+nfs_pre_untar_probe_or_die() {
+  note "Running pre-untar probe from target: /mnt/external/system.img readability"
+  wait_for_target_ssh 180 || die "Target SSH (fc00:1:1:0::2) not reachable before APP untar stage."
+  sshpass -p root ssh -6 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    root@fc00:1:1:0::2 "set -e; test -r /mnt/external/system.img; ls -lh /mnt/external/system.img; dd if=/mnt/external/system.img of=/dev/null bs=4M count=4 status=none" \
+    || die "Pre-untar probe failed: target could not reliably read /mnt/external/system.img"
+  note "Pre-untar probe OK"
 }
 
 # ---------- CHANGE 2: force NFS/RPC into known-good state ----------
@@ -184,6 +234,8 @@ FLASH_WORK_DIR=""
 NM_WAS_ACTIVE=0
 TLP_WAS_ACTIVE=0
 USB_AUTOSUSPEND_PREV=""
+WATCHDOG_PID=""
+WATCHDOG_ABORT_REASON_FILE=""
 
 # ---------- local staging to eliminate USB bus contention ----------
 
@@ -291,6 +343,13 @@ restore_env() {
     systemctl start zerotier-one 2>/dev/null || true
   fi
 
+  if [[ -n "${WATCHDOG_PID}" ]]; then
+    kill "${WATCHDOG_PID}" 2>/dev/null || true
+  fi
+  if [[ -n "${WATCHDOG_ABORT_REASON_FILE}" && -f "${WATCHDOG_ABORT_REASON_FILE}" ]]; then
+    rm -f "${WATCHDOG_ABORT_REASON_FILE}" 2>/dev/null || true
+  fi
+
   # Copy logs back onto the installer USB if it's still present
   if [[ -d "${HERE}" ]]; then
     mkdir -p "${HERE}/flash-logs"
@@ -336,6 +395,88 @@ dump_failure_diagnostics() {
   echo "--- kernel: recent USB events ---"
   dmesg -T 2>/dev/null | tail -200 | grep -iE 'usb|xhci|rndis|cdc_ether|cdc_ncm|disconnect|reset' || true
   echo
+}
+
+start_flash_watchdog() {
+  local flash_pid="$1"
+  local flash_log="$2"
+  WATCHDOG_ABORT_REASON_FILE="$(mktemp /tmp/tinderbox-watchdog-reason.XXXXXX)"
+  : > "${WATCHDOG_ABORT_REASON_FILE}"
+
+  (
+    set +e
+    local iface missing_usb=0 missing_net=0 preprobe_done=0
+    while kill -0 "${flash_pid}" 2>/dev/null; do
+      # 1) Detect transition into APP untar stage, then force a read probe from target.
+      if [[ "${preprobe_done}" -eq 0 ]] && grep -q "tar .* -x -I 'zstd -T0' -pf /mnt/external/system.img" "${flash_log}" 2>/dev/null; then
+        preprobe_done=1
+        if ! nfs_pre_untar_probe_or_die; then
+          echo "watchdog: pre-untar probe failed (/mnt/external/system.img unreadable on target)" > "${WATCHDOG_ABORT_REASON_FILE}"
+          kill "${flash_pid}" 2>/dev/null || true
+          exit 0
+        fi
+      fi
+
+      # 2) Jetson presence watchdog (APX/recovery USB device should remain visible through flash phases)
+      if lsusb | grep -qi '0955:'; then
+        missing_usb=0
+      else
+        missing_usb=$((missing_usb+1))
+      fi
+
+      # 3) USB NIC watchdog
+      iface="$(find_usb_net_iface)"
+      if [[ -n "${iface}" ]]; then
+        missing_net=0
+      else
+        missing_net=$((missing_net+1))
+      fi
+
+      # Give brief grace period (3 checks * 2s = ~6s) to avoid false positives on reboot boundary.
+      if (( missing_usb >= 3 )); then
+        echo "watchdog: Jetson USB device disappeared (no 0955:* in lsusb for ~6s)" > "${WATCHDOG_ABORT_REASON_FILE}"
+        kill "${flash_pid}" 2>/dev/null || true
+        exit 0
+      fi
+      if (( missing_net >= 3 )); then
+        echo "watchdog: Jetson USB NIC disappeared (no usb0/enx for ~6s)" > "${WATCHDOG_ABORT_REASON_FILE}"
+        kill "${flash_pid}" 2>/dev/null || true
+        exit 0
+      fi
+
+      sleep 2
+    done
+  ) &
+  WATCHDOG_PID="$!"
+}
+
+run_flash_with_watchdog() {
+  local flash_log="$1"
+  shift
+  local -a cmd=( "$@" )
+
+  local flash_rc=0
+  # Keep tee logging, but make command PID trackable for watchdog.
+  (
+    "${cmd[@]}"
+  ) > >(tee "${flash_log}") 2>&1 &
+  local flash_pid=$!
+
+  start_flash_watchdog "${flash_pid}" "${flash_log}"
+  wait "${flash_pid}" || flash_rc=$?
+
+  if [[ -n "${WATCHDOG_PID}" ]]; then
+    kill "${WATCHDOG_PID}" 2>/dev/null || true
+    WATCHDOG_PID=""
+  fi
+
+  if [[ -n "${WATCHDOG_ABORT_REASON_FILE}" && -s "${WATCHDOG_ABORT_REASON_FILE}" ]]; then
+    warn "$(cat "${WATCHDOG_ABORT_REASON_FILE}")"
+    # Preserve original non-zero if already failed; else force failure due to watchdog abort.
+    [[ "${flash_rc}" -ne 0 ]] || flash_rc=99
+  fi
+
+  return "${flash_rc}"
 }
 
 # ---------- NVMe selection ----------
@@ -419,6 +560,10 @@ ensure_flash_deps
 ensure_usb0_udev_rule
 ensure_usb0_offload_udev_rule
 preflight_nfs_rpc_or_die
+
+# Explicit safety-net in case udev RUN did not fire after rename.
+apply_usb_offloads_now
+
 preflight_no_vpn_or_die
 temporarily_disable_firewall
 temporarily_disable_nm_and_usb_autosuspend
@@ -519,18 +664,21 @@ FLASH_CMD=(
 
 flash_rc=0
 if command -v systemd-inhibit >/dev/null 2>&1; then
-  systemd-inhibit \
-    --what=sleep:shutdown:idle \
-    --mode=block \
-    --why="Jetson flashing (NFS over USB)" \
-    "${FLASH_CMD[@]}" 2>&1 | tee "${FLASH_LOG}" || flash_rc=$?
+  run_flash_with_watchdog "${FLASH_LOG}" \
+    systemd-inhibit \
+      --what=sleep:shutdown:idle \
+      --mode=block \
+      --why="Jetson flashing (NFS over USB)" \
+      "${FLASH_CMD[@]}" || flash_rc=$?
 else
-  "${FLASH_CMD[@]}" 2>&1 | tee "${FLASH_LOG}" || flash_rc=$?
+  run_flash_with_watchdog "${FLASH_LOG}" \
+    "${FLASH_CMD[@]}" || flash_rc=$?
 fi
 
 popd >/dev/null
 
 if [[ "${flash_rc}" -ne 0 ]]; then
+  [[ "${flash_rc}" -eq 99 ]] && warn "Flash aborted by watchdog due to transport/link failure."
   dump_failure_diagnostics "${FLASH_LOG}"
   die "Flash failed with exit code ${flash_rc}. See diagnostics above and log: ${FLASH_LOG}"
 fi
