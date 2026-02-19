@@ -128,6 +128,9 @@ UFW_WAS_ACTIVE=0
 FIREWALLD_WAS_ACTIVE=0
 ZT_WAS_STOPPED=0
 FLASH_WORK_DIR=""
+NM_WAS_ACTIVE=0
+TLP_WAS_ACTIVE=0
+USB_AUTOSUSPEND_PREV=""
 
 # ---------- local staging to eliminate USB bus contention ----------
 
@@ -183,7 +186,45 @@ temporarily_disable_firewall() {
   fi
 }
 
+temporarily_disable_nm_and_usb_autosuspend() {
+  # NetworkManager can reconfigure usb0 mid-flash and kill the fc00:: link.
+  if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    warn "Stopping NetworkManager for the duration of the flash (prevents usb0 interference)"
+    systemctl stop NetworkManager || true
+    NM_WAS_ACTIVE=1
+  fi
+
+  # TLP (if present) frequently autosuspends USB devices mid-transfer.
+  if systemctl is-active --quiet tlp 2>/dev/null; then
+    warn "Stopping tlp for the duration of the flash (prevents USB autosuspend)"
+    systemctl stop tlp || true
+    TLP_WAS_ACTIVE=1
+  fi
+
+  # Disable kernel USB autosuspend globally for the flash run.
+  if [[ -w /sys/module/usbcore/parameters/autosuspend ]]; then
+    USB_AUTOSUSPEND_PREV="$(cat /sys/module/usbcore/parameters/autosuspend 2>/dev/null || true)"
+    echo -1 > /sys/module/usbcore/parameters/autosuspend || true
+    note "usbcore.autosuspend set to -1 for the flash run"
+  fi
+}
+
 restore_env() {
+  # Restore USB autosuspend value
+  if [[ -n "${USB_AUTOSUSPEND_PREV}" && -w /sys/module/usbcore/parameters/autosuspend ]]; then
+    echo "${USB_AUTOSUSPEND_PREV}" > /sys/module/usbcore/parameters/autosuspend || true
+  fi
+
+  if [[ "${TLP_WAS_ACTIVE}" -eq 1 ]]; then
+    note "Restarting tlp"
+    systemctl start tlp 2>/dev/null || true
+  fi
+
+  if [[ "${NM_WAS_ACTIVE}" -eq 1 ]]; then
+    note "Restarting NetworkManager"
+    systemctl start NetworkManager 2>/dev/null || true
+  fi
+
   if [[ "${UFW_WAS_ACTIVE}" -eq 1 ]]; then
     note "Re-enabling ufw"
     ufw --force enable 2>/dev/null || true
@@ -196,6 +237,13 @@ restore_env() {
     note "Restarting ZeroTier"
     systemctl start zerotier-one 2>/dev/null || true
   fi
+
+  # Copy logs back onto the installer USB if it's still present
+  if [[ -d "${HERE}" ]]; then
+    mkdir -p "${HERE}/flash-logs"
+    rsync -a "${LOG_DIR}/" "${HERE}/flash-logs/" 2>/dev/null || true
+  fi
+
   if [[ -n "${FLASH_WORK_DIR}" && -d "${FLASH_WORK_DIR}" ]]; then
     note "Removing local flash staging dir: ${FLASH_WORK_DIR}"
     rm -rf "${FLASH_WORK_DIR}"
@@ -206,7 +254,8 @@ trap restore_env EXIT
 
 # ---------- CHANGE 6: log capture and diagnostics ----------
 
-LOG_DIR="${HERE}/flash-logs"
+LOG_DIR="/var/tmp/tinderbox-flash-logs"
+mkdir -p "${LOG_DIR}"
 
 dump_failure_diagnostics() {
   local log_file="$1"
@@ -316,6 +365,7 @@ ensure_usb0_udev_rule
 preflight_nfs_rpc_or_die
 preflight_no_vpn_or_die
 temporarily_disable_firewall
+temporarily_disable_nm_and_usb_autosuspend
 
 L4T_SOURCE="${HERE}/Linux_for_Tegra"
 [[ -d "${L4T_SOURCE}" ]] || die "Missing Linux_for_Tegra directory next to this script. Did you run tools/prepare-installer-media.sh?"
