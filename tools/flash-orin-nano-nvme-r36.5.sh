@@ -48,6 +48,11 @@ LOG_DIR="${WORK_DIR}/logs"
 # Populated by --yes flag or read from defaults.env below.
 ASSUME_YES="false"
 
+# State saved by harden_usb_for_flash / restored by restore_flash_env.
+_NM_WAS_ACTIVE=0
+_TLP_WAS_ACTIVE=0
+_USB_AUTOSUSPEND_PREV=""
+
 # Load repo defaults (URLs etc.) if present — never fatal if absent, we have fallbacks.
 _DEFAULTS_ENV="${REPO_ROOT}/config/defaults.env"
 if [[ -f "$_DEFAULTS_ENV" ]]; then
@@ -134,15 +139,157 @@ resolve_qspi_cfg() {
   return 1
 }
 
+# Locate flash_l4t_t234_nvme*.xml under tools/kernel_flash/.
+resolve_nvme_xml() {
+  local f=""
+
+  f="$(find "${L4T_DIR}/tools/kernel_flash" -maxdepth 6 -type f -name 'flash_l4t_t234_nvme.xml' | head -n 1 || true)"
+  if [[ -n "$f" ]]; then echo "$f"; return 0; fi
+
+  f="$(find "${L4T_DIR}/tools/kernel_flash" -maxdepth 6 -type f -name 'flash_l4t_t234_nvme*.xml' | head -n 1 || true)"
+  if [[ -n "$f" ]]; then echo "$f"; return 0; fi
+
+  return 1
+}
+
+###############################################################################
+# USB link stability
+###############################################################################
+#
+# The NVIDIA initrd flash tool streams system.img (the rootfs) to the Jetson
+# over NFS on a USB Ethernet gadget (RNDIS "usb0").  Several common host-side
+# services silently kill this link mid-transfer:
+#
+#   - USB autosuspend: kernel suspends the USB device after idle timeout
+#   - NetworkManager: reconfigures usb0, breaking the fc00:: IPv6 link
+#   - TLP (laptops):  aggressively autosuspends USB devices
+#   - NIC offloads:   TSO/GSO/GRO on USB gadget NICs corrupt NFS streams
+#
+# We disable all of these before flashing and restore them on exit.
+
+harden_usb_for_flash() {
+  say "USB stability: hardening host for sustained USB gadget transfer..."
+
+  # 1. Disable kernel USB autosuspend globally.
+  if [[ -w /sys/module/usbcore/parameters/autosuspend ]]; then
+    _USB_AUTOSUSPEND_PREV="$(cat /sys/module/usbcore/parameters/autosuspend 2>/dev/null || true)"
+    echo -1 | sudo tee /sys/module/usbcore/parameters/autosuspend >/dev/null
+    say "  usbcore.autosuspend: disabled (was ${_USB_AUTOSUSPEND_PREV})"
+  fi
+
+  # 2. Stop NetworkManager — it reconfigures usb0 mid-flash and kills the link.
+  if sudo systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    say "  NetworkManager: stopping for duration of flash..."
+    sudo systemctl stop NetworkManager || true
+    _NM_WAS_ACTIVE=1
+  fi
+
+  # 3. Stop TLP — it autosuspends USB devices on laptops.
+  if sudo systemctl is-active --quiet tlp 2>/dev/null; then
+    say "  TLP: stopping for duration of flash..."
+    sudo systemctl stop tlp || true
+    _TLP_WAS_ACTIVE=1
+  fi
+
+  # 4. Install udev rules so the gadget NIC stays named "usb0" and gets
+  #    offloads disabled automatically when it appears.
+  _install_usb0_udev_rules
+
+  say "  USB hardening applied."
+}
+
+_install_usb0_udev_rules() {
+  # Keep the USB gadget NIC named "usb0" (Ubuntu Predictable Names renames
+  # it to "enx<mac>" which breaks NVIDIA's tool).
+  local rename_rule="/etc/udev/rules.d/99-usb0-jetson.rules"
+  if ! [[ -f "$rename_rule" ]] || ! grep -qF 'rndis_host' "$rename_rule" 2>/dev/null; then
+    echo 'SUBSYSTEM=="net", ACTION=="add", DRIVERS=="rndis_host", NAME="usb0"' \
+      | sudo tee "$rename_rule" >/dev/null
+    sudo udevadm control --reload-rules
+    say "  udev: installed usb0 rename rule"
+  fi
+
+  # Disable offloads that corrupt NFS over USB gadget NICs.
+  local offload_helper="/usr/local/sbin/tinderbox-usb0-offloads.sh"
+  if ! [[ -x "$offload_helper" ]]; then
+    sudo tee "$offload_helper" >/dev/null <<'OFFLOAD_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+IFACE="${1:-usb0}"
+for _ in {1..20}; do
+  ip link show "${IFACE}" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+ip link set "${IFACE}" up 2>/dev/null || true
+ip link set "${IFACE}" mtu 1500 2>/dev/null || true
+if command -v ethtool >/dev/null 2>&1; then
+  ethtool -K "${IFACE}" tso off gso off gro off lro off tx off rx off sg off 2>/dev/null || true
+  ethtool -K "${IFACE}" tx-checksum-ip-generic off rx-checksum off 2>/dev/null || true
+fi
+ip link set "${IFACE}" txqueuelen 1000 2>/dev/null || true
+OFFLOAD_EOF
+    sudo chmod 0755 "$offload_helper"
+    say "  installed: ${offload_helper}"
+  fi
+
+  local offload_rule="/etc/udev/rules.d/99-zz-usb0-jetson-offloads.rules"
+  if ! [[ -f "$offload_rule" ]] || ! grep -qF 'tinderbox-usb0-offloads' "$offload_rule" 2>/dev/null; then
+    echo 'SUBSYSTEM=="net", ACTION=="add", NAME=="usb0", RUN+="/usr/local/sbin/tinderbox-usb0-offloads.sh usb0"' \
+      | sudo tee "$offload_rule" >/dev/null
+    sudo udevadm control --reload-rules
+    say "  udev: installed usb0 offload rule"
+  fi
+}
+
+# Apply USB NIC offload settings immediately (safety net if udev rule hasn't
+# fired yet or if the interface was renamed before the rule was installed).
+apply_usb_offloads_now() {
+  local iface=""
+  if ip link show usb0 >/dev/null 2>&1; then
+    iface="usb0"
+  else
+    iface="$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^enx' | head -n1 || true)"
+  fi
+  [[ -n "$iface" ]] || return 0
+
+  say "  Applying USB NIC offloads on ${iface} now..."
+  sudo ip link set "$iface" up 2>/dev/null || true
+  sudo ip link set "$iface" mtu 1500 2>/dev/null || true
+  if command -v ethtool >/dev/null 2>&1; then
+    sudo ethtool -K "$iface" tso off gso off gro off lro off tx off rx off sg off 2>/dev/null || true
+    sudo ethtool -K "$iface" tx-checksum-ip-generic off rx-checksum off 2>/dev/null || true
+  fi
+  sudo ip link set "$iface" txqueuelen 1000 2>/dev/null || true
+}
+
+# Restore everything we touched.  Called via EXIT trap.
+restore_flash_env() {
+  # Restore USB autosuspend.
+  if [[ -n "${_USB_AUTOSUSPEND_PREV}" && -w /sys/module/usbcore/parameters/autosuspend ]]; then
+    echo "${_USB_AUTOSUSPEND_PREV}" | sudo tee /sys/module/usbcore/parameters/autosuspend >/dev/null 2>&1 || true
+  fi
+
+  # Restart NetworkManager if we stopped it.
+  if [[ "${_NM_WAS_ACTIVE}" -eq 1 ]]; then
+    say "Restarting NetworkManager..."
+    sudo systemctl start NetworkManager 2>/dev/null || true
+  fi
+
+  # Restart TLP if we stopped it.
+  if [[ "${_TLP_WAS_ACTIVE}" -eq 1 ]]; then
+    say "Restarting TLP..."
+    sudo systemctl start tlp 2>/dev/null || true
+  fi
+
+  # Clean NFS exports.
+  cleanup_stale_exports
+}
+
 ###############################################################################
 # NFS preflight
 ###############################################################################
 
-# The NVIDIA initrd flash tool serves the rootfs (system.img) to the Jetson
-# over NFS on the usb0 link.  A stale or non-running rpcbind / nfs-kernel-server
-# is the most common cause of "cannot mount the NFS server" failures when the
-# Jetson tries to write the APP (rootfs) partition.  We restart both into a
-# known-good state before handing control to l4t_initrd_flash.sh.
+# Restart rpcbind + NFS server into a known-good state.
 preflight_nfs() {
   say "NFS preflight: ensuring host NFS stack is in a clean state..."
 
@@ -183,19 +330,6 @@ preflight_nfs() {
     say "           NFS ports may be blocked. To open them on usb0 for this session:"
     say "             sudo ufw allow in on usb0"
   fi
-}
-
-# Locate flash_l4t_t234_nvme*.xml under tools/kernel_flash/.
-resolve_nvme_xml() {
-  local f=""
-
-  f="$(find "${L4T_DIR}/tools/kernel_flash" -maxdepth 6 -type f -name 'flash_l4t_t234_nvme.xml' | head -n 1 || true)"
-  if [[ -n "$f" ]]; then echo "$f"; return 0; fi
-
-  f="$(find "${L4T_DIR}/tools/kernel_flash" -maxdepth 6 -type f -name 'flash_l4t_t234_nvme*.xml' | head -n 1 || true)"
-  if [[ -n "$f" ]]; then echo "$f"; return 0; fi
-
-  return 1
 }
 
 ###############################################################################
@@ -357,9 +491,12 @@ main() {
 
   mkdir -p "$WORK_DIR" "$LOG_DIR"
 
-  # Clean NFS export entries on entry AND on exit (success or failure).
+  # Clean NFS exports on entry; restore_flash_env handles exit cleanup.
   cleanup_stale_exports
-  trap cleanup_stale_exports EXIT
+
+  # Harden the USB link and register the restore-on-exit trap.
+  harden_usb_for_flash
+  trap restore_flash_env EXIT
 
   # Always start from a clean Linux_for_Tegra tree (prevents stale/half-generated flash states).
   if [[ -d "$L4T_DIR" ]]; then
@@ -394,7 +531,7 @@ main() {
 
   # Only run NVIDIA prereq installer if something key is missing (avoids random apt upgrades every run).
   local missing=()
-  for c in sshpass exportfs rpcinfo mkfs.vfat gdisk parted cpio zstd xxd; do
+  for c in sshpass exportfs rpcinfo mkfs.vfat gdisk parted cpio zstd xxd ethtool; do
     command -v "$c" >/dev/null 2>&1 || missing+=("$c")
   done
   if ((${#missing[@]})); then
@@ -406,10 +543,14 @@ main() {
   fi
 
   # Restart rpcbind + nfs-kernel-server into a clean state before the Jetson
-  # tries to mount the rootfs over NFS.  Must happen after prerequisites are
-  # confirmed installed (exportfs, rpcinfo etc.) and before l4t_initrd_flash.sh.
+  # tries to mount the rootfs over NFS.
   preflight_nfs
 
+  # Apply USB NIC offloads now as a safety net (in case usb0 appeared before
+  # the udev rule was installed).
+  apply_usb_offloads_now
+
+  say ""
   say "Flashing using NVIDIA initrd workflow for Orin Nano + NVMe..."
   say "BOARD=${BOARD}"
   say "OS NVMe partition to be ERASED/Flashed: /dev/${TARGET_NVME_PART}"
@@ -417,13 +558,26 @@ main() {
 
   # -p passes extra args to the inner flash.sh call (QSPI config).
   # -c provides the external (NVMe) partition layout for the initrd flash stage.
-  sudo ./tools/kernel_flash/l4t_initrd_flash.sh \
-    --showlogs \
-    --network usb0 \
-    --external-device "${EXTERNAL_DEVICE_PART}" \
-    -c "${NVME_XML}" \
-    -p "-c ${QSPI_CFG}" \
-    "${BOARD}" "${TARGET_NVME_PART}" |& tee "$LOG_DIR/flash_${L4T_RELEASE}.log"
+  # systemd-inhibit prevents the host from sleeping mid-flash.
+  local flash_cmd=(
+    sudo ./tools/kernel_flash/l4t_initrd_flash.sh
+    --showlogs
+    --network usb0
+    --external-device "${EXTERNAL_DEVICE_PART}"
+    -c "${NVME_XML}"
+    -p "-c ${QSPI_CFG}"
+    "${BOARD}" "${TARGET_NVME_PART}"
+  )
+
+  if command -v systemd-inhibit >/dev/null 2>&1; then
+    systemd-inhibit \
+      --what=sleep:shutdown:idle \
+      --mode=block \
+      --why="Jetson flashing (NFS over USB)" \
+      "${flash_cmd[@]}" |& tee "$LOG_DIR/flash_${L4T_RELEASE}.log"
+  else
+    "${flash_cmd[@]}" |& tee "$LOG_DIR/flash_${L4T_RELEASE}.log"
+  fi
 
   say "Flash complete."
   say "Log file: ${LOG_DIR}/flash_${L4T_RELEASE}.log"
