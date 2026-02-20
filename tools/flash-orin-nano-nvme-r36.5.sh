@@ -134,6 +134,57 @@ resolve_qspi_cfg() {
   return 1
 }
 
+###############################################################################
+# NFS preflight
+###############################################################################
+
+# The NVIDIA initrd flash tool serves the rootfs (system.img) to the Jetson
+# over NFS on the usb0 link.  A stale or non-running rpcbind / nfs-kernel-server
+# is the most common cause of "cannot mount the NFS server" failures when the
+# Jetson tries to write the APP (rootfs) partition.  We restart both into a
+# known-good state before handing control to l4t_initrd_flash.sh.
+preflight_nfs() {
+  say "NFS preflight: ensuring host NFS stack is in a clean state..."
+
+  local restarted_any="false"
+
+  # rpcbind must come up before nfs-kernel-server.
+  if sudo systemctl cat rpcbind &>/dev/null; then
+    sudo systemctl restart rpcbind
+    say "  rpcbind: restarted."
+    restarted_any="true"
+  else
+    say "  rpcbind: not managed by systemd — ensure portmapper is running manually."
+  fi
+
+  # nfs-kernel-server (Debian/Ubuntu name; nfs-server on Fedora/RHEL)
+  local nfs_unit=""
+  if sudo systemctl cat nfs-kernel-server &>/dev/null; then
+    nfs_unit="nfs-kernel-server"
+  elif sudo systemctl cat nfs-server &>/dev/null; then
+    nfs_unit="nfs-server"
+  fi
+
+  if [[ -n "$nfs_unit" ]]; then
+    sudo systemctl restart "$nfs_unit"
+    say "  ${nfs_unit}: restarted."
+    restarted_any="true"
+  else
+    say "  nfs-kernel-server: not managed by systemd — ensure NFS server is running manually."
+  fi
+
+  [[ "$restarted_any" == "true" ]] || \
+    say "  WARNING: Could not restart NFS services. Flash may fail at the APP rootfs step."
+
+  # Warn if UFW is active — NFS ports (111 portmapper, 2049 nfs) must be reachable
+  # from the Jetson on the usb0 interface.
+  if command -v ufw &>/dev/null && sudo ufw status 2>/dev/null | grep -q "^Status: active"; then
+    say "  WARNING: UFW firewall is active. If flash fails at the APP partition step,"
+    say "           NFS ports may be blocked. To open them on usb0 for this session:"
+    say "             sudo ufw allow in on usb0"
+  fi
+}
+
 # Locate flash_l4t_t234_nvme*.xml under tools/kernel_flash/.
 resolve_nvme_xml() {
   local f=""
@@ -353,6 +404,11 @@ main() {
   else
     say "Host prerequisites look installed (skipping l4t_flash_prerequisites.sh)."
   fi
+
+  # Restart rpcbind + nfs-kernel-server into a clean state before the Jetson
+  # tries to mount the rootfs over NFS.  Must happen after prerequisites are
+  # confirmed installed (exportfs, rpcinfo etc.) and before l4t_initrd_flash.sh.
+  preflight_nfs
 
   say "Flashing using NVIDIA initrd workflow for Orin Nano + NVMe..."
   say "BOARD=${BOARD}"
