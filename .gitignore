@@ -2,15 +2,20 @@
 /build/
 /dist/
 
-# NVIDIA artifacts (large, keep out of git)
-artifacts/nvidia/*.tbz2
-artifacts/nvidia/*.zip
-artifacts/nvidia/*.tar*
-artifacts/nvidia/*.sha*
-artifacts/nvidia/*.txt
+# NVIDIA artifacts — large binaries, never commit
+# Ignore everything in this directory except the placeholder that tells
+# users what belongs here. New file types (debs, zips, etc.) are covered
+# automatically without needing to update this file.
+artifacts/nvidia/*
+!artifacts/nvidia/PLACE_NVIDIA_TARBALLS_HERE.txt
 
-# Flash logs (runtime output)
+# Logs — never commit, regardless of where they land
+*.log
 flash-logs/
+
+# Temp / partial files — never commit
+*.partial
+*.tmp
 
 # OS-specific junk
 .DS_Store
