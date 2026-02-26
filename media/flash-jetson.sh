@@ -234,8 +234,6 @@ FLASH_WORK_DIR=""
 NM_WAS_ACTIVE=0
 TLP_WAS_ACTIVE=0
 USB_AUTOSUSPEND_PREV=""
-WATCHDOG_PID=""
-WATCHDOG_ABORT_REASON_FILE=""
 
 # ---------- local staging to eliminate USB bus contention ----------
 
@@ -343,12 +341,6 @@ restore_env() {
     systemctl start zerotier-one 2>/dev/null || true
   fi
 
-  if [[ -n "${WATCHDOG_PID}" ]]; then
-    kill "${WATCHDOG_PID}" 2>/dev/null || true
-  fi
-  if [[ -n "${WATCHDOG_ABORT_REASON_FILE}" && -f "${WATCHDOG_ABORT_REASON_FILE}" ]]; then
-    rm -f "${WATCHDOG_ABORT_REASON_FILE}" 2>/dev/null || true
-  fi
 
   # Copy logs back onto the installer USB if it's still present
   if [[ -d "${HERE}" ]]; then
@@ -395,88 +387,6 @@ dump_failure_diagnostics() {
   echo "--- kernel: recent USB events ---"
   dmesg -T 2>/dev/null | tail -200 | grep -iE 'usb|xhci|rndis|cdc_ether|cdc_ncm|disconnect|reset' || true
   echo
-}
-
-start_flash_watchdog() {
-  local flash_pid="$1"
-  local flash_log="$2"
-  WATCHDOG_ABORT_REASON_FILE="$(mktemp /tmp/tinderbox-watchdog-reason.XXXXXX)"
-  : > "${WATCHDOG_ABORT_REASON_FILE}"
-
-  (
-    set +e
-    local iface missing_usb=0 missing_net=0 preprobe_done=0
-    while kill -0 "${flash_pid}" 2>/dev/null; do
-      # 1) Detect transition into APP untar stage, then force a read probe from target.
-      if [[ "${preprobe_done}" -eq 0 ]] && grep -q "tar .* -x -I 'zstd -T0' -pf /mnt/external/system.img" "${flash_log}" 2>/dev/null; then
-        preprobe_done=1
-        if ! nfs_pre_untar_probe_or_die; then
-          echo "watchdog: pre-untar probe failed (/mnt/external/system.img unreadable on target)" > "${WATCHDOG_ABORT_REASON_FILE}"
-          kill "${flash_pid}" 2>/dev/null || true
-          exit 0
-        fi
-      fi
-
-      # 2) Jetson presence watchdog (APX/recovery USB device should remain visible through flash phases)
-      if lsusb | grep -qi '0955:'; then
-        missing_usb=0
-      else
-        missing_usb=$((missing_usb+1))
-      fi
-
-      # 3) USB NIC watchdog
-      iface="$(find_usb_net_iface)"
-      if [[ -n "${iface}" ]]; then
-        missing_net=0
-      else
-        missing_net=$((missing_net+1))
-      fi
-
-      # Give brief grace period (3 checks * 2s = ~6s) to avoid false positives on reboot boundary.
-      if (( missing_usb >= 3 )); then
-        echo "watchdog: Jetson USB device disappeared (no 0955:* in lsusb for ~6s)" > "${WATCHDOG_ABORT_REASON_FILE}"
-        kill "${flash_pid}" 2>/dev/null || true
-        exit 0
-      fi
-      if (( missing_net >= 3 )); then
-        echo "watchdog: Jetson USB NIC disappeared (no usb0/enx for ~6s)" > "${WATCHDOG_ABORT_REASON_FILE}"
-        kill "${flash_pid}" 2>/dev/null || true
-        exit 0
-      fi
-
-      sleep 2
-    done
-  ) &
-  WATCHDOG_PID="$!"
-}
-
-run_flash_with_watchdog() {
-  local flash_log="$1"
-  shift
-  local -a cmd=( "$@" )
-
-  local flash_rc=0
-  # Keep tee logging, but make command PID trackable for watchdog.
-  (
-    "${cmd[@]}"
-  ) > >(tee "${flash_log}") 2>&1 &
-  local flash_pid=$!
-
-  start_flash_watchdog "${flash_pid}" "${flash_log}"
-  wait "${flash_pid}" || flash_rc=$?
-
-  if [[ -n "${WATCHDOG_PID}" ]]; then
-    kill "${WATCHDOG_PID}" 2>/dev/null || true
-    WATCHDOG_PID=""
-  fi
-
-  if [[ -n "${WATCHDOG_ABORT_REASON_FILE}" && -s "${WATCHDOG_ABORT_REASON_FILE}" ]]; then
-    warn "$(cat "${WATCHDOG_ABORT_REASON_FILE}")"
-    # Preserve original non-zero if already failed; else force failure due to watchdog abort.
-    [[ "${flash_rc}" -ne 0 ]] || flash_rc=99
-  fi
-
-  return "${flash_rc}"
 }
 
 # ---------- NVMe selection ----------
@@ -664,21 +574,14 @@ FLASH_CMD=(
 
 flash_rc=0
 if command -v systemd-inhibit >/dev/null 2>&1; then
-  run_flash_with_watchdog "${FLASH_LOG}" \
-    systemd-inhibit \
-      --what=sleep:shutdown:idle \
-      --mode=block \
-      --why="Jetson flashing (NFS over USB)" \
-      "${FLASH_CMD[@]}" || flash_rc=$?
+  systemd-inhibit     --what=sleep:shutdown:idle     --mode=block     --why="Jetson flashing (NFS over USB)"     "${FLASH_CMD[@]}" 2>&1 | tee "${FLASH_LOG}" || flash_rc=$?
 else
-  run_flash_with_watchdog "${FLASH_LOG}" \
-    "${FLASH_CMD[@]}" || flash_rc=$?
+  "${FLASH_CMD[@]}" 2>&1 | tee "${FLASH_LOG}" || flash_rc=$?
 fi
 
 popd >/dev/null
 
 if [[ "${flash_rc}" -ne 0 ]]; then
-  [[ "${flash_rc}" -eq 99 ]] && warn "Flash aborted by watchdog due to transport/link failure."
   dump_failure_diagnostics "${FLASH_LOG}"
   die "Flash failed with exit code ${flash_rc}. See diagnostics above and log: ${FLASH_LOG}"
 fi
