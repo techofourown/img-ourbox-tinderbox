@@ -1,7 +1,5 @@
 # ADR-0001: Consume the OurBox OS Platform Contract from `sw-ourbox-os`
 
-## Status
-Proposed
 
 ## Context
 
