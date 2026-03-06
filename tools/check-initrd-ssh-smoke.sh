@@ -67,7 +67,11 @@ check_port() {
     nc -z -6 -w 3 "${host}" "${ssh_port}" >/dev/null 2>&1
     return
   fi
-  ssh -o PreferredAuthentications=none -o NumberOfPasswordPrompts=0 "${ssh_opts[@]}" "root@${host}" "true" >/dev/null 2>&1 || true
+  if command -v ssh-keyscan >/dev/null 2>&1; then
+    ssh-keyscan -6 -T 3 -p "${ssh_port}" "${host}" >/dev/null 2>&1
+    return
+  fi
+  ssh -o PreferredAuthentications=none -o NumberOfPasswordPrompts=0 "${ssh_opts[@]}" "root@${host}" "true" >/dev/null 2>&1
 }
 
 installer_auth="none"
