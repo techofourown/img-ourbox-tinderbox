@@ -75,6 +75,23 @@ if [[ -f "$_DEFAULTS_ENV" ]]; then
   source "$_DEFAULTS_ENV"
 fi
 
+DEFAULT_INSTALLER_SSH_PASSWORD_HASH='$6$ourboxinstall$GgJGorVZ2X.yl0cQk8yIqYDawhEuB47d9m.k9t9HP1afvwC3ALmMxTDtKT2NjDBMqkUOVzvm7LK2ZHxBt2KxH1'
+if [[ -z "${OURBOX_INSTALLER_SSH_MODE:-}" ]]; then
+  case "$(printf '%s' "${OURBOX_VARIANT:-prod}" | tr '[:upper:]' '[:lower:]')" in
+    dev|support|debug|diag|diagnostic|lab|labs) OURBOX_INSTALLER_SSH_MODE="both" ;;
+    *) OURBOX_INSTALLER_SSH_MODE="key" ;;
+  esac
+fi
+OURBOX_INSTALLER_SSH_USER="${OURBOX_INSTALLER_SSH_USER:-ourbox-installer}"
+OURBOX_INSTALLER_SSH_PASSWORD_HASH="${OURBOX_INSTALLER_SSH_PASSWORD_HASH:-${DEFAULT_INSTALLER_SSH_PASSWORD_HASH}}"
+OURBOX_INSTALLER_SSH_AUTHORIZED_KEYS="${OURBOX_INSTALLER_SSH_AUTHORIZED_KEYS:-}"
+# Keep root/root automation available in initrd diagnose mode.
+OURBOX_INSTALLER_SSH_ALLOW_ROOT="${OURBOX_INSTALLER_SSH_ALLOW_ROOT:-1}"
+if [[ "${OURBOX_INSTALLER_SSH_ALLOW_ROOT}" != "1" ]]; then
+  printf '%s\n' "WARNING: OURBOX_INSTALLER_SSH_ALLOW_ROOT=${OURBOX_INSTALLER_SSH_ALLOW_ROOT} is ignored in diagnose mode." >&2
+  printf '%s\n' "         Root login remains required for machine automation on initrd." >&2
+fi
+
 ###############################################################################
 # Helpers
 ###############################################################################
@@ -512,6 +529,99 @@ fetch_artifacts() {
 JETSON_INITRD_IPV6="fc00:1:1:0::2"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5)
 
+# Best-effort bootstrap of a human diagnostics account inside initrd.
+# This intentionally does NOT disable root login in diagnose mode so existing
+# machine automation (root/root over sshpass) remains stable.
+bootstrap_initrd_installer_ssh_user() {
+  local ssh_mode="${OURBOX_INSTALLER_SSH_MODE:-key}"
+  local ssh_user="${OURBOX_INSTALLER_SSH_USER:-ourbox-installer}"
+  local ssh_hash="${OURBOX_INSTALLER_SSH_PASSWORD_HASH:-${DEFAULT_INSTALLER_SSH_PASSWORD_HASH}}"
+  local ssh_keys="${OURBOX_INSTALLER_SSH_AUTHORIZED_KEYS:-}"
+
+  case "${ssh_mode}" in
+    off|key|password|both) ;;
+    *) ssh_mode="key" ;;
+  esac
+
+  if [[ "${ssh_mode}" == "off" ]]; then
+    say "Initrd diagnostics user bootstrap disabled (OURBOX_INSTALLER_SSH_MODE=off)."
+    return 0
+  fi
+
+  say "Configuring initrd diagnostics user '${ssh_user}' (mode=${ssh_mode})..."
+  if sshpass -p root ssh "${SSH_OPTS[@]}" "root@${JETSON_INITRD_IPV6}" \
+    sh -s -- "${ssh_mode}" "${ssh_user}" "${ssh_hash}" "${ssh_keys}" <<'BOOTSTRAP_EOF'
+set -eu
+mode="$1"
+user="$2"
+pass_hash="$3"
+auth_keys="$4"
+
+case "$mode" in
+  off|key|password|both) ;;
+  *) mode="key" ;;
+esac
+
+if [ "$mode" = "off" ]; then
+  exit 0
+fi
+
+if ! id "$user" >/dev/null 2>&1; then
+  if command -v useradd >/dev/null 2>&1; then
+    useradd -m -s /bin/sh "$user" >/dev/null 2>&1 || useradd -m "$user" >/dev/null 2>&1 || true
+  fi
+  if ! id "$user" >/dev/null 2>&1 && command -v adduser >/dev/null 2>&1; then
+    adduser -D -h "/home/$user" "$user" >/dev/null 2>&1 \
+      || adduser --disabled-password --gecos "" "$user" >/dev/null 2>&1 \
+      || true
+  fi
+fi
+
+if ! id "$user" >/dev/null 2>&1; then
+  echo "could-not-create-user"
+  exit 1
+fi
+
+home_dir="$(awk -F: -v u="$user" '$1==u {print $6; exit}' /etc/passwd 2>/dev/null || true)"
+[ -n "$home_dir" ] || home_dir="/home/$user"
+
+if [ "$mode" = "password" ] || [ "$mode" = "both" ]; then
+  if [ -n "$pass_hash" ]; then
+    if command -v chpasswd >/dev/null 2>&1; then
+      printf '%s:%s\n' "$user" "$pass_hash" | chpasswd -e >/dev/null 2>&1 || true
+    elif command -v usermod >/dev/null 2>&1; then
+      usermod -p "$pass_hash" "$user" >/dev/null 2>&1 || true
+    fi
+  fi
+else
+  if command -v passwd >/dev/null 2>&1; then
+    passwd -l "$user" >/dev/null 2>&1 || true
+  fi
+fi
+
+mkdir -p "$home_dir/.ssh"
+chmod 0700 "$home_dir/.ssh" >/dev/null 2>&1 || true
+if [ "$mode" = "key" ] || [ "$mode" = "both" ]; then
+  if [ -n "$auth_keys" ]; then
+    printf '%s\n' "$auth_keys" > "$home_dir/.ssh/authorized_keys"
+    chmod 0600 "$home_dir/.ssh/authorized_keys" >/dev/null 2>&1 || true
+  else
+    rm -f "$home_dir/.ssh/authorized_keys" >/dev/null 2>&1 || true
+  fi
+else
+  rm -f "$home_dir/.ssh/authorized_keys" >/dev/null 2>&1 || true
+fi
+chown -R "$user:$user" "$home_dir/.ssh" >/dev/null 2>&1 || true
+echo "ready user=${user} mode=${mode}"
+BOOTSTRAP_EOF
+  then
+    say "Initrd diagnostics user ready: ssh ${ssh_user}@${JETSON_INITRD_IPV6}"
+  else
+    say "WARNING: Failed to configure initrd diagnostics user '${ssh_user}'."
+    say "         Root automation remains available via sshpass root@${JETSON_INITRD_IPV6}."
+  fi
+}
+
 # Patch the extracted BSP's nv_flash_from_network.sh to inject a background
 # telemetry daemon that runs alongside the flash.  This writes to stdout,
 # which the host sees through the SSH pipe.
@@ -701,7 +811,7 @@ run_diagnose_mode() {
 
   say "Launching NVIDIA initrd flash in --initrd (boot-only) mode..."
   say "Once the device boots, you can SSH in with:"
-  say "  sshpass -p root ssh ${SSH_OPTS[*]} root@${JETSON_INITRD_IPV6}"
+  say "  ssh root@${JETSON_INITRD_IPV6}   # machine automation credentials are managed by tooling"
   say ""
 
   sudo ./tools/kernel_flash/l4t_initrd_flash.sh \
@@ -762,6 +872,9 @@ run_diagnose_mode() {
   done
   echo ""
   say "Jetson SSH is up (${ssh_waited}s after initrd boot confirmation)."
+  say ""
+
+  bootstrap_initrd_installer_ssh_user
   say ""
 
   # Run the diagnostic suite.
@@ -858,7 +971,10 @@ DIAG_EOF
   say "=== End Diagnostic Report ==="
   say ""
   say "The Jetson is still booted in initrd. You can SSH in manually:"
-  say "  sshpass -p root ssh root@${JETSON_INITRD_IPV6}"
+  say "  ssh root@${JETSON_INITRD_IPV6}   # machine automation credentials are managed by tooling"
+  if [[ "${OURBOX_INSTALLER_SSH_MODE}" != "off" ]]; then
+    say "  ssh ${OURBOX_INSTALLER_SSH_USER}@${JETSON_INITRD_IPV6}    # if initrd user bootstrap succeeded"
+  fi
   say ""
   say "When done, press Ctrl-C or power-cycle the Jetson."
 
