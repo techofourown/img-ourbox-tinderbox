@@ -1,3 +1,15 @@
+# [0.2.0](https://github.com/techofourown/img-ourbox-tinderbox/compare/v0.1.0...v0.2.0) (2026-03-06)
+
+
+### Bug Fixes
+
+* **installer-ssh:** make initrd smoke probe fail closed ([779bd8c](https://github.com/techofourown/img-ourbox-tinderbox/commit/779bd8cc96c3baa5d3051b6d7e07a0ee8588d51b))
+
+
+### Features
+
+* **diagnose:** add human installer SSH contract to initrd flow ([e63e420](https://github.com/techofourown/img-ourbox-tinderbox/commit/e63e4207d1cfc97ad862bb45fe5f4e9f64f6223a))
+
 # [0.1.0](https://github.com/techofourown/img-ourbox-tinderbox/compare/v0.0.0...v0.1.0) (2026-02-27)
 
 
