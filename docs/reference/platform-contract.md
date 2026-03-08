@@ -36,6 +36,15 @@ In this repo, that content lives under:
 This is allowed during Phase 0, but it must be treated as an **upstream platform contract snapshot**
 — not as a freehand "platform policy playground."
 
+This same boundary applies to installer-selection logic:
+
+- `sw-ourbox-os` now owns the shared installer-selection contract and reference resolver for
+  catalog/install-defaults-driven installers
+- Tinderbox is **not yet** a consumer of that shared resolver because its current flow is still an
+  offline Jetson flashing pipeline rather than a catalog-driven payload installer
+- if Tinderbox later grows an OS-payload/catalog lane, it should adopt that upstream contract
+  rather than inventing a fourth local policy
+
 ---
 
 ## Required provenance recording
