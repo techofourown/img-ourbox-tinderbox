@@ -96,6 +96,25 @@ Edit `config/defaults.env` before preparing the installer USB if you want to cha
 - default username/password/hostname
 - which NVMe is assumed to be OS vs DATA (defaults: OS=nvme0n1, DATA=nvme1n1)
 
+## Shared selection seam
+
+Tinderbox is intentionally **not** part of the first Matchbox/Woodbox shared installer-selection
+resolver migration.
+
+Why:
+
+- today it is a host-side Jetson flasher, not a catalog-driven registry installer
+- its hard parts are NVIDIA Force Recovery, initrd diagnostics, BSP/rootfs staging, and offline USB media
+
+What still applies:
+
+- `sw-ourbox-os` remains the upstream owner of install-defaults and the installer-selection contract
+- `install-defaults/defaults/tinderbox.env` exists upstream as the future control-plane profile for
+  a Tinderbox payload-selection lane
+
+When Tinderbox grows that lane, it should adopt the upstream shared installer-selection contract and
+reference resolver. Until then, its flashing flow remains hardware-specific by design.
+
 ## Repo layout
 
 - `tools/fetch-nvidia-artifacts.sh` — downloads NVIDIA artifacts (online step; requires license acceptance)
