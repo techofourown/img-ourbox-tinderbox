@@ -1,3 +1,10 @@
+## [0.2.1](https://github.com/techofourown/img-ourbox-tinderbox/compare/v0.2.0...v0.2.1) (2026-03-10)
+
+
+### Bug Fixes
+
+* resolve pr batch diffs from pr refs ([20c4048](https://github.com/techofourown/img-ourbox-tinderbox/commit/20c4048a0e8019045eb492b9fde6a89c19d4f42b))
+
 # [0.2.0](https://github.com/techofourown/img-ourbox-tinderbox/compare/v0.1.0...v0.2.0) (2026-03-06)
 
 
