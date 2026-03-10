@@ -1,0 +1,17 @@
+name: PR Batch Big Picture Tool Tests
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+jobs:
+  pr-batch-big-picture:
+    name: PR batch comparison tool tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run PR batch comparison tool tests
+        run: python3 tools/test_pr_batch_big_picture.py
