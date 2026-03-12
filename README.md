@@ -109,11 +109,43 @@ Why:
 What still applies:
 
 - `sw-ourbox-os` remains the upstream owner of install-defaults and the installer-selection contract
+- `sw-ourbox-os` also owns the future airgap-platform selection lane and its shared vocabulary
 - `install-defaults/defaults/tinderbox.env` exists upstream as the future control-plane profile for
   a Tinderbox payload-selection lane
 
+Reserved future installer control names:
+
+- `AIRGAP_PLATFORM_REPO`
+- `AIRGAP_PLATFORM_ARCH`
+- `AIRGAP_PLATFORM_CHANNEL`
+- `AIRGAP_PLATFORM_REF`
+- `AIRGAP_PLATFORM_DEFAULT_REF`
+- `AIRGAP_PLATFORM_CATALOG_ENABLED`
+- `AIRGAP_PLATFORM_CATALOG_TAG`
+- `AIRGAP_PLATFORM_CHANNEL_STABLE_TAG`
+- `AIRGAP_PLATFORM_CHANNEL_BETA_TAG`
+- `AIRGAP_PLATFORM_CHANNEL_NIGHTLY_TAG`
+- `AIRGAP_PLATFORM_CHANNEL_EXP_LABS_TAG`
+
+Reserved future installed provenance names:
+
+- `OURBOX_AIRGAP_PLATFORM_SOURCE`
+- `OURBOX_AIRGAP_PLATFORM_REVISION`
+- `OURBOX_AIRGAP_PLATFORM_VERSION`
+- `OURBOX_AIRGAP_PLATFORM_CREATED`
+- `OURBOX_AIRGAP_PLATFORM_ARCH`
+- `OURBOX_AIRGAP_PLATFORM_PROFILE`
+- `OURBOX_AIRGAP_PLATFORM_K3S_VERSION`
+- `OURBOX_AIRGAP_PLATFORM_IMAGES_LOCK_SHA256`
+- `OURBOX_AIRGAP_PLATFORM_ARTIFACT_SOURCE`
+- `OURBOX_AIRGAP_PLATFORM_REF`
+- `OURBOX_AIRGAP_PLATFORM_DIGEST`
+- `OURBOX_AIRGAP_PLATFORM_SELECTION_SOURCE`
+- `OURBOX_AIRGAP_PLATFORM_RELEASE_CHANNEL`
+
 When Tinderbox grows that lane, it should adopt the upstream shared installer-selection contract and
-reference resolver. Until then, its flashing flow remains hardware-specific by design.
+reference resolver rather than inventing a fourth vocabulary. Until then, its
+flashing flow remains hardware-specific by design.
 
 ## Repo layout
 
