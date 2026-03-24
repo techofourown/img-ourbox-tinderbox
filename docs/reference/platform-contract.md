@@ -40,8 +40,8 @@ This same boundary applies to installer-selection logic:
 
 - `sw-ourbox-os` now owns the shared installer-selection contract and reference resolver for
   catalog/install-defaults-driven installers
-- `sw-ourbox-os` also owns the future airgap-platform browsing contract and the
-  `AIRGAP_PLATFORM_*` / `OURBOX_AIRGAP_PLATFORM_*` vocabulary reserved for that lane
+- `sw-ourbox-os` also owns the future ourbox-substrate browsing contract and the
+  `OURBOX_SUBSTRATE_*` vocabulary reserved for that lane
 - Tinderbox is **not yet** a consumer of that shared resolver because its current flow is still an
   offline Jetson flashing pipeline rather than a catalog-driven payload installer
 - if Tinderbox later grows an OS-payload/catalog lane, it should adopt that upstream contract
